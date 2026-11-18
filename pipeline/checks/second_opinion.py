@@ -39,6 +39,74 @@ from ..common import WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
 from ..model_cache import get_preds  # noqa: F401
 
 
+NAME = "second_opinion"
+
+
+def _label_rows(ds, stem, n_cls):
+    """[(số dòng gốc, (cls, cx, cy, w, h))] cho các dòng hợp lệ; dòng hỏng bỏ qua (check khác đã báo)."""
+    out = []
+    for n, text in ds.read_label_lines(stem) or []:
+        try:
+            b = parse_yolo_line(text)
+        except ValueError:
+            continue
+        if 0 <= b[0] < n_cls:
+            out.append((n, b))
+    return out
+
+
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    c = cfg["second_opinion"]
+    conf, min_area, fp_conf = c["conf"], c["min_area_px"], c["fp_conf"]
+    iou_missing, iou_match, iou_loose = c["iou_missing"], c["iou_match"], c["iou_loose"]
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+    n_cls = len(ds.classes)
+    issues = []
+
+    for p in ds.image_files():
+        stem = p.stem
+        if stem not in preds or not ds.label_path(stem).exists():
+            continue
+        size = ds.image_size(stem)
+        if not size:
+            continue                                   # ảnh hỏng: check images đã báo
+        W, H = size
+        labels = _label_rows(ds, stem, n_cls)
+        rows = preds[stem]
+
+        # --- từ phía model: model thấy gì mà nhãn sai/thiếu?
+        for cls, cf, *box in rows:
+            if cf < conf or box[2] * W * box[3] * H < min_area:
+                continue
+            cands = [(iou_xywh(box, lb[1:]), lb[0]) for _, lb in labels]
+            cands = [(iou, lc) for iou, lc in cands if iou >= iou_missing]
+            if not cands:
+                issues.append(Issue(NAME, WARN, "POSSIBLE_MISSING", stem,
+                                    f"model thấy lớp {ds.classes[cls]} (conf {cf:.2f}) nhưng nhãn không có box",
+                                    extra={"conf": cf, "cls": cls, "box": list(box)}))
+                continue
+            same = [iou for iou, lc in cands if lc == cls]
+            if same:
+                best = max(same)
+                if best < iou_loose:
+                    issues.append(Issue(NAME, WARN, "POSSIBLE_LOOSE_BOX", stem,
+                                        f"box lớp {ds.classes[cls]} lệch/lỏng so với model (IoU {best:.2f})",
+                                        extra={"conf": cf, "iou": round(best, 4)}))
+                continue                               # nhãn đúng lớp đã phủ vật này
+            best_iou, best_cls = max(cands)
+            if best_iou >= iou_match:
+                issues.append(Issue(NAME, WARN, "POSSIBLE_WRONG_CLASS", stem,
+                                    f"nhãn là {ds.classes[best_cls]}, model nói {ds.classes[cls]} (conf {cf:.2f}, IoU {best_iou:.2f})",
+                                    extra={"conf": cf, "iou": round(best_iou, 4), "label_cls": best_cls, "pred_cls": cls}))
+            # IoU khác lớp trong [iou_missing, iou_match): mơ hồ -> không cờ
+
+        # --- từ phía nhãn: box nhãn không khớp vật nào model thấy
+        fp_boxes = [r[2:] for r in rows if r[1] >= fp_conf]
+        for n, lb in labels:
+            if all(iou_xywh(lb[1:], b) < iou_missing for b in fp_boxes):
+                issues.append(Issue(NAME, WARN, "POSSIBLE_FALSE_POS", stem,
+                                    f"box lớp {ds.classes[lb[0]]} không khớp dự đoán nào của model",
+                                    line=n, extra={"iou": 0.0 if not fp_boxes else round(max(iou_xywh(lb[1:], b) for b in fp_boxes), 4)}))
+
+    return issues
