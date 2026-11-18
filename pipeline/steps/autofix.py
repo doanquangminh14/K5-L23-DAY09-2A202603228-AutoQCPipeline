@@ -34,6 +34,98 @@ import yaml  # noqa: F401
 from ..common import ERROR, parse_yolo_line  # noqa: F401
 
 
+DROP_CODES = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+REMOVE_CODES = {"DUP_IMAGE_EXACT", "DUP_IMAGE_NEAR", "LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}
+
+
+def _fx(image, line, action, before, after):
+    return {"image": image, "line": line, "action": action, "before": before, "after": after}
+
+
+def _clip(text):
+    """Cắt box về [0,1]. Trả về dòng mới, hoặc None nếu box không còn diện tích / không parse được."""
+    try:
+        c, x, y, w, h = parse_yolo_line(text)
+    except ValueError:
+        return None
+    x1, x2 = max(0.0, x - w / 2), min(1.0, x + w / 2)
+    y1, y2 = max(0.0, y - h / 2), min(1.0, y + h / 2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return f"{c} {(x1 + x2) / 2:.6f} {(y1 + y2) / 2:.6f} {x2 - x1:.6f} {y2 - y1:.6f}"
+
+
+def _remove_image(ds, stem):
+    img = ds.image_path(stem)
+    lab = ds.label_path(stem)
+    if img is None and not lab.exists():
+        return None                                  # đã xoá rồi -> idempotent
+    if img is not None:
+        img.unlink()
+    if lab.exists():
+        lab.unlink()
+    return img.name if img is not None else lab.name
+
+
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    errors = [i for i in issues if i.severity == ERROR]      # không bao giờ đụng tới WARN
+    fixes = []
+
+    # 1. xoá ảnh (trùng, rò rỉ test, hỏng, quá nhỏ) — làm TRƯỚC để bỏ qua issue dòng của ảnh đã xoá
+    removed = set()
+    for i in errors:
+        if i.code in REMOVE_CODES and i.image not in removed:
+            removed.add(i.image)
+            name = _remove_image(ds, i.image)
+            if name:
+                fixes.append(_fx(i.image, "", "remove_image", f"{name} ({i.code})", "(đã xoá ảnh + nhãn)"))
+
+    # 2. tên lớp trong data.yaml
+    if any(i.code == "BAD_CLASS_NAME" for i in errors) and ds.yaml_path.exists():
+        d = yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) or {}
+        old = d.get("names")
+        new = list(cfg["classes"])
+        if old != new:
+            d["names"] = new
+            ds.yaml_path.write_text(yaml.safe_dump(d, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            fixes.append(_fx("data.yaml", "", "rename_classes", str(old), str(new)))
+
+    # 3. ảnh thiếu nhãn: máy không bịa nhãn, chỉ ghi lại để chuyển người gán (không tạo file)
+    for stem in sorted({i.image for i in errors if i.code == "MISSING_LABEL_FILE"} - removed):
+        if not ds.label_path(stem).exists():
+            fixes.append(_fx(stem, "", "needs_label", "(không có file)", "chuyển người gán"))
+
+    # 4. lỗi theo dòng: gom theo file, dùng số dòng GỐC, ghi lại MỘT lần
+    drop, clip = defaultdict(set), defaultdict(set)
+    for i in errors:
+        if i.line is None or i.image in removed:
+            continue
+        if i.code in DROP_CODES:
+            drop[i.image].add(i.line)
+        elif i.code == "BOX_OUT_OF_IMAGE":
+            clip[i.image].add(i.line)
+
+    for stem in sorted(set(drop) | set(clip)):
+        p = ds.label_path(stem)
+        if not p.exists():
+            continue                                  # ảnh/nhãn đã bị xoá: bỏ qua êm
+        raw = p.read_text(encoding="utf-8", errors="replace").splitlines()
+        out = []
+        for n, text in enumerate(raw, 1):             # n = số dòng gốc (kể cả dòng trống)
+            if n in drop[stem]:                       # xoá dòng thắng clip
+                fixes.append(_fx(stem, n, "drop_line", text, ""))
+                continue
+            if n in clip[stem]:
+                new = _clip(text)
+                if new is None:                       # cắt xong không còn diện tích -> xoá dòng
+                    fixes.append(_fx(stem, n, "drop_line", text, ""))
+                    continue
+                if new != text:
+                    fixes.append(_fx(stem, n, "clip_box", text, new))
+                out.append(new)
+                continue
+            out.append(text)
+        if out != raw:
+            p.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+
+    return fixes
